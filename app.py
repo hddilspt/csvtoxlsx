@@ -17,64 +17,67 @@ def home():
 @app.route('/convert', methods=['POST'])
 def convert():
     try:
-        if 'file' not in request.files:
-            return {"error": "No file part in the request"}, 400
+        # 1) Prefer multipart 'file' (Postman/browsers)
+        f = request.files.get('file')
+        if f and f.filename:
+            filename = secure_filename(f.filename)
+            data = f.read()
+            mode = 'multipart'
+        else:
+            # 2) Raw body fallback (Power Automate HTTP)
+            data = request.get_data() or b''
+            if not data:
+                return {"error": "No file part in the request"}, 400
+            filename = request.args.get('filename') or 'upload'
+            mode = 'raw'
 
-        f = request.files['file']
-        if not f or f.filename == '':
-            return {"error": "No selected file"}, 400
+        # detect by content/extension
+        head = data[:8]
+        is_xlsx = head.startswith(b'PK')
+        is_xls  = head.startswith(b'\xD0\xCF\x11\xE0')
+        ext = os.path.splitext(filename)[1].lower()
 
-        ext = os.path.splitext(f.filename)[1].lower()
-
-        # CSV -> XLSX (uses your existing pandas/xlsxwriter)
-        if ext == '.csv':
-            df = pd.read_csv(f)
+        # CSV -> XLSX
+        if (ext == '.csv') and not (is_xlsx or is_xls):
+            df = pd.read_csv(io.BytesIO(data))
             out = io.BytesIO()
-            with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
-                df.to_excel(writer, index=False, sheet_name="Sheet1")
+            with pd.ExcelWriter(out, engine='xlsxwriter') as w:
+                df.to_excel(w, index=False, sheet_name="Sheet1")
             out.seek(0)
-            return send_file(
-                out,
+            resp = send_file(out,
                 mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                as_attachment=True,
-                download_name="converted.xlsx"
-            )
+                as_attachment=True, download_name="converted.xlsx")
+            resp.headers['X-Debug-Path'] = f'{mode}:csv->xlsx'
+            return resp
 
-        # XLSX/XLS -> PDF (via LibreOffice headless)
-        elif ext in ('.xlsx', '.xls'):
+        # XLS/XLSX -> PDF
+        if is_xlsx or is_xls or ext in ('.xlsx', '.xls'):
             if shutil.which("soffice") is None:
                 return {"error": "LibreOffice (soffice) not found in PATH."}, 500
-
             with tempfile.TemporaryDirectory() as tmp:
-                in_path = os.path.join(tmp, secure_filename(f.filename))
-                f.save(in_path)
-
-                cmd = ["soffice", "--headless", "--convert-to", "pdf", "--outdir", tmp, in_path]
-                proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if proc.returncode != 0:
-                    return {
-                        "error": "PDF conversion failed.",
-                        "stdout": proc.stdout.decode('utf-8', 'ignore')[:400],
-                        "stderr": proc.stderr.decode('utf-8', 'ignore')[:400]
-                    }, 500
-
+                tmp_ext = '.xlsx' if (is_xlsx or ext == '.xlsx') else '.xls'
+                in_path = os.path.join(tmp, 'upload' + tmp_ext)
+                with open(in_path, 'wb') as fh: fh.write(data)
+                cmd = ["soffice","--headless","--convert-to","pdf","--outdir",tmp,in_path]
+                p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if p.returncode != 0:
+                    return {"error": "PDF conversion failed.",
+                            "stdout": p.stdout.decode('utf-8','ignore')[:400],
+                            "stderr": p.stderr.decode('utf-8','ignore')[:400]}, 500
                 pdf_path = os.path.splitext(in_path)[0] + ".pdf"
                 if not os.path.exists(pdf_path):
-                    # Fallback to first generated PDF
-                    candidates = [p for p in os.listdir(tmp) if p.lower().endswith(".pdf")]
-                    if not candidates:
-                        return {"error": "Converted PDF not found."}, 500
-                    pdf_path = os.path.join(tmp, candidates[0])
-
-                with open(pdf_path, "rb") as fh:
+                    cands = [x for x in os.listdir(tmp) if x.lower().endswith('.pdf')]
+                    if not cands: return {"error": "Converted PDF not found."}, 500
+                    pdf_path = os.path.join(tmp, cands[0])
+                with open(pdf_path, 'rb') as fh:
                     buf = io.BytesIO(fh.read())
                 buf.seek(0)
-                return send_file(buf, mimetype="application/pdf",
+                resp = send_file(buf, mimetype="application/pdf",
                                  as_attachment=True, download_name=os.path.basename(pdf_path))
+                resp.headers['X-Debug-Path'] = f'{mode}:xlsx->pdf'
+                return resp
 
-        else:
-            return {"error": "Unsupported file type. Upload .csv, .xlsx or .xls."}, 400
-
+        return {"error": "Unsupported file type. Upload .csv, .xlsx or .xls."}, 400
     except Exception as e:
         return {"error": str(e)}, 500
 
